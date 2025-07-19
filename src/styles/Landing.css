@@ -1,0 +1,88 @@
+/* File: src/pages/Landing.css */
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  background-color: #f8f9fb;
+  color: #333;
+}
+
+.landing-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.landing-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background-color: #2c3e50;
+  color: white;
+  padding: 1rem 2rem;
+}
+
+.logo {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.nav-links a {
+  color: white;
+  margin-left: 1.5rem;
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.nav-links a:hover {
+  text-decoration: underline;
+}
+
+.landing-main {
+  flex: 1;
+  padding: 3rem 2rem;
+  max-width: 800px;
+  margin: auto;
+  text-align: center;
+}
+
+.tagline {
+  margin: 1rem 0 2rem;
+  font-size: 1.2rem;
+  color: #555;
+}
+
+.get-started-btn {
+  display: inline-block;
+  background-color: #007bff;
+  color: white;
+  padding: 0.75rem 1.5rem;
+  border-radius: 6px;
+  text-decoration: none;
+  font-weight: bold;
+  transition: background 0.3s ease;
+}
+
+.get-started-btn:hover {
+  background-color: #0056b3;
+}
+
+.how-it-works {
+  text-align: left;
+  margin-top: 4rem;
+}
+
+.how-it-works h2 {
+  font-size: 1.5rem;
+  color: #333;
+  margin-bottom: 1rem;
+}
+
+.how-it-works ol {
+  padding-left: 1.5rem;
+}
+
+.how-it-works li {
+  margin-bottom: 1rem;
+  line-height: 1.6;
+}
