@@ -7,11 +7,11 @@ import Login from "./pages/Login";
 import Register from "./pages/Register";
 import RecruiterDashboard from "./pages/RecruiterDashboard";
 import ApplicantDashboard from "./pages/ApplicantDashboard";
-import JobPost from "./pages/JobPost"; // Fixed: Changed from PostJob to JobPost
+import JobPost from "./pages/JobPost";
 import ApplyJob from "./pages/ApplyJob";
 import JobList from "./pages/Joblist";
 import InterviewFeedback from "./pages/InterviewFeedback";
-// import ViewApplicant from "./pages/ViewApplicant"; // Comment out until created
+import InterviewPage from "./pages/interview"; // Add the interview page import
 import ProtectedRoute from "./components/ProtectedRoute";
 import { AuthProvider, useAuth } from "./context/AuthContext";
 import ApplicationResponse from "./pages/ApplicationResponse";
@@ -70,10 +70,47 @@ function App() {
             <Route path="/login" element={<Login />} />
             <Route path="/redirect" element={<RoleBasedRedirect />} />
             <Route path="/jobs" element={<JobList />} />
+            <Route path="/post-job" element={<JobPost />} />
 
             {/* Applicant Routes */}
             <Route
               path="/applicant/dashboard"
+              element={
+                <ProtectedRoute allowedRoles={["applicant"]}>
+                  <ApplicantDashboard />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/applicant/browse-jobs"
+              element={
+                <ProtectedRoute allowedRoles={["applicant"]}>
+                  <JobList />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/applicant/resume-upload"
+              element={
+                <ProtectedRoute allowedRoles={["applicant"]}>
+                  <div className="max-w-4xl mx-auto p-6">
+                    <h1 className="text-2xl font-bold mb-4">Resume Upload</h1>
+                    <p className="text-gray-600">Upload and manage your resume here. (Coming Soon)</p>
+                  </div>
+                </ProtectedRoute>
+              }
+            />
+            {/* AI Interview Routes */}
+            <Route
+              path="/applicant/ai-interview"
+              element={
+                <ProtectedRoute allowedRoles={["applicant"]}>
+                  <InterviewPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/applicant/my-applications"
               element={
                 <ProtectedRoute allowedRoles={["applicant"]}>
                   <ApplicantDashboard />
@@ -93,14 +130,6 @@ function App() {
               element={
                 <ProtectedRoute allowedRoles={["applicant"]}>
                   <ApplyJob />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path="/interview-feedback"
-              element={
-                <ProtectedRoute allowedRoles={["applicant"]}>
-                  <InterviewFeedback />
                 </ProtectedRoute>
               }
             />
@@ -130,16 +159,76 @@ function App() {
                 </ProtectedRoute>
               }
             />
-            {/* Temporarily comment out ViewApplicant route until file is created
             <Route
+              path="/recruiter/manage-jobs"
+              element={
+                <ProtectedRoute allowedRoles={["recruiter"]}>
+                  <div className="max-w-6xl mx-auto p-6">
+                    <h1 className="text-2xl font-bold mb-4">Manage Jobs</h1>
+                    <p className="text-gray-600">Manage your posted jobs here. (Coming Soon)</p>
+                  </div>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/recruiter/view-applicants"
+              element={
+                <ProtectedRoute allowedRoles={["recruiter"]}>
+                  <div className="max-w-6xl mx-auto p-6">
+                    <h1 className="text-2xl font-bold mb-4">View Applicants</h1>
+                    <p className="text-gray-600">View and manage applicants here. (Coming Soon)</p>
+                  </div>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/recruiter/analytics"
+              element={
+                <ProtectedRoute allowedRoles={["recruiter"]}>
+                  <div className="max-w-6xl mx-auto p-6">
+                    <h1 className="text-2xl font-bold mb-4">Analytics</h1>
+                    <p className="text-gray-600">View analytics and insights here. (Coming Soon)</p>
+                  </div>
+                </ProtectedRoute>
+              }
+            />
+            {/* <Route
               path="/recruiter/view-applicant/:applicationId"
               element={
                 <ProtectedRoute allowedRoles={["recruiter"]}>
                   <ViewApplicant />
                 </ProtectedRoute>
               }
+            /> */}
+
+            {/* Additional Routes */}
+            <Route
+              path="/notifications"
+              element={
+                <div className="max-w-4xl mx-auto p-6">
+                  <h1 className="text-2xl font-bold mb-4">Notifications</h1>
+                  <p className="text-gray-600">All notifications will appear here. (Coming Soon)</p>
+                </div>
+              }
             />
-            */}
+            <Route
+              path="/help"
+              element={
+                <div className="max-w-4xl mx-auto p-6">
+                  <h1 className="text-2xl font-bold mb-4">Help & Support</h1>
+                  <p className="text-gray-600">Get help and support here. (Coming Soon)</p>
+                </div>
+              }
+            />
+            <Route path="/interview-feedback" element={<InterviewFeedback />} />
+            <Route
+              path="/interview"
+              element={
+                <ProtectedRoute allowedRoles={["applicant"]}>
+                  <InterviewPage />
+                </ProtectedRoute>
+              }
+            />
 
             {/* Catch all route - redirect to home */}
             <Route path="*" element={<Navigate to="/" replace />} />

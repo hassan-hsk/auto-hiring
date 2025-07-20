@@ -54,7 +54,7 @@ const Navbar = () => {
                                     Dashboard
                                 </Link>
                                 <Link
-                                    to="/applicant/browse-jobs"
+                                    to="/jobs"
                                     className="hover:underline hover:text-indigo-200 transition font-medium"
                                 >
                                     Browse Jobs
@@ -140,6 +140,12 @@ const Navbar = () => {
                                 >
                                     Features
                                 </button>
+                                <Link
+                                    to="/jobs"
+                                    className="hover:underline hover:text-indigo-200 transition font-medium"
+                                >
+                                    Browse Jobs
+                                </Link>
                             </>
                         ) : (
                             /* Other pages - Use regular links */
@@ -161,6 +167,12 @@ const Navbar = () => {
                                     className="hover:underline hover:text-indigo-200 transition font-medium"
                                 >
                                     Features
+                                </Link>
+                                <Link
+                                    to="/jobs"
+                                    className="hover:underline hover:text-indigo-200 transition font-medium"
+                                >
+                                    Browse Jobs
                                 </Link>
                             </>
                         )}
@@ -232,6 +244,19 @@ const Navbar = () => {
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                             </svg>
                         </Link>
+
+                        {/* User Profile Badge */}
+                        <div className="flex items-center space-x-2 bg-indigo-700 px-3 py-1 rounded">
+                            <div className="w-6 h-6 bg-indigo-500 rounded-full flex items-center justify-center text-xs font-bold">
+                                {user?.displayName?.charAt(0) || user?.email?.charAt(0) || 'U'}
+                            </div>
+                            <span className="text-sm font-medium">
+                                {user?.displayName || user?.email?.split('@')[0] || 'User'}
+                            </span>
+                            <span className="text-xs bg-indigo-500 px-2 py-1 rounded capitalize">
+                                {role}
+                            </span>
+                        </div>
 
                         {/* Logout */}
                         <button

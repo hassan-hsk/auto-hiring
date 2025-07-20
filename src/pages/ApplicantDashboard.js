@@ -28,12 +28,11 @@ const ApplicantDashboard = () => {
                     // This query requires an index
                     const applicationsQuery = query(
                         collection(db, "applications"),
-                        where("applicantId", "==", user.uid),
-                        orderBy("appliedAt", "desc")
+                        where("applicantId", "==", user.uid)
                     );
                     const applicationsSnapshot = await getDocs(applicationsQuery);
-                    
-                    // Process each application and fetch job details
+
+                    // Process applications and sort manually later
                     for (const appDoc of applicationsSnapshot.docs) {
                         const appData = appDoc.data();
                         let jobData = null;
@@ -66,16 +65,27 @@ const ApplicantDashboard = () => {
                             interviewStatus: appData.interviewStatus || 'not_started'
                         });
                     }
+
+                    // Sort manually after fetching
+                    applicationsData.sort((a, b) => {
+                        const dateA = a.appliedAt || a.createdAt || new Date(0);
+                        const dateB = b.appliedAt || b.createdAt || new Date(0);
+
+                        if (dateA?.toDate) return dateB.toDate() - dateA.toDate();
+                        if (dateA instanceof Date) return dateB - dateA;
+                        return new Date(dateB) - new Date(dateA);
+                    });
+
                 } catch (indexError) {
                     console.warn("Index not available, falling back to simple query:", indexError);
-                    
+
                     // Fallback query without orderBy (doesn't require index)
                     const simpleQuery = query(
                         collection(db, "applications"),
                         where("applicantId", "==", user.uid)
                     );
                     const snapshot = await getDocs(simpleQuery);
-                    
+
                     for (const appDoc of snapshot.docs) {
                         const appData = appDoc.data();
                         let jobData = null;
@@ -105,12 +115,12 @@ const ApplicantDashboard = () => {
                             interviewStatus: appData.interviewStatus || 'not_started'
                         });
                     }
-                    
+
                     // Sort manually since we couldn't use orderBy
                     applicationsData.sort((a, b) => {
                         const dateA = a.appliedAt || a.createdAt || new Date(0);
                         const dateB = b.appliedAt || b.createdAt || new Date(0);
-                        
+
                         if (dateA?.toDate) return dateB.toDate() - dateA.toDate();
                         if (dateA instanceof Date) return dateB - dateA;
                         return new Date(dateB) - new Date(dateA);
@@ -252,7 +262,8 @@ const ApplicantDashboard = () => {
     };
 
     const handleStartInterview = (app) => {
-        navigate(`/interview-feedback`);
+        console.log("Starting interview for application:", app.id);
+        navigate(`/applicant/ai-interview?applicationId=${app.id}`);
     };
 
     const handleQuickApply = (jobId) => {
@@ -269,7 +280,6 @@ const ApplicantDashboard = () => {
             </div>
         );
     }
-
     if (error) {
         return (
             <div className="max-w-6xl mx-auto p-6">
@@ -426,6 +436,7 @@ const ApplicantDashboard = () => {
                                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
                                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Match Score</th>
                                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Resume Score</th>
+                                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Interview</th>
                                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
                                 </tr>
                             </thead>
@@ -454,6 +465,26 @@ const ApplicantDashboard = () => {
                                                 {app.resumeScore || 0}%
                                             </div>
                                         </td>
+                                        {/* New Interview Status Column */}
+                                        <td className="px-6 py-4 whitespace-nowrap">
+                                            {app.interviewEligible ? (
+                                                <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${app.interviewStatus === 'completed'
+                                                    ? 'bg-green-100 text-green-800'
+                                                    : 'bg-blue-100 text-blue-800'
+                                                    }`}>
+                                                    {app.interviewStatus === 'completed' ? '✅ Completed' : '🎯 Eligible'}
+                                                </span>
+                                            ) : (
+                                                <span className="inline-flex px-2 py-1 text-xs font-semibold rounded-full bg-gray-100 text-gray-600">
+                                                    ❌ Not Eligible
+                                                </span>
+                                            )}
+                                            {app.interviewScore > 0 && (
+                                                <div className={`text-xs mt-1 ${getScoreColor(app.interviewScore)}`}>
+                                                    Score: {app.interviewScore}%
+                                                </div>
+                                            )}
+                                        </td>
                                         <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
                                             <div className="flex space-x-2">
                                                 <button
@@ -465,9 +496,12 @@ const ApplicantDashboard = () => {
                                                 {app.interviewEligible && (
                                                     <button
                                                         onClick={() => handleStartInterview(app)}
-                                                        className="text-green-600 hover:text-green-900"
+                                                        className={`${app.interviewStatus === 'completed'
+                                                            ? 'text-purple-600 hover:text-purple-900'
+                                                            : 'text-green-600 hover:text-green-900'
+                                                            } font-medium`}
                                                     >
-                                                        Interview
+                                                        {app.interviewStatus === 'completed' ? 'View Results' : 'Start Interview'}
                                                     </button>
                                                 )}
                                             </div>
@@ -499,7 +533,7 @@ const ApplicantDashboard = () => {
                                 <div className="w-full bg-gray-200 rounded-full h-2">
                                     <div
                                         className={`h-2 rounded-full ${app.aiScore >= 80 ? 'bg-green-500' :
-                                                app.aiScore >= 60 ? 'bg-yellow-500' : 'bg-red-500'
+                                            app.aiScore >= 60 ? 'bg-yellow-500' : 'bg-red-500'
                                             }`}
                                         style={{ width: `${app.aiScore}%` }}
                                     ></div>
@@ -529,7 +563,7 @@ const ApplicantDashboard = () => {
                                 <div className="w-full bg-gray-200 rounded-full h-2">
                                     <div
                                         className={`h-2 rounded-full ${app.resumeScore >= 80 ? 'bg-green-500' :
-                                                app.resumeScore >= 60 ? 'bg-yellow-500' : 'bg-red-500'
+                                            app.resumeScore >= 60 ? 'bg-yellow-500' : 'bg-red-500'
                                             }`}
                                         style={{ width: `${app.resumeScore}%` }}
                                     ></div>
