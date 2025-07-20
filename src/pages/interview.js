@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { useAuth } from "../context/AuthContext";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { doc, getDoc, updateDoc } from "firebase/firestore";
 import { db } from "../firebase/firebase";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const InterviewPage = () => {
     const { user } = useAuth();
@@ -10,9 +11,19 @@ const InterviewPage = () => {
     const [searchParams] = useSearchParams();
     const applicationId = searchParams.get('applicationId');
 
-    // Video and Audio refs
+    // Initialize Google Gemini
+    const genAI = new GoogleGenerativeAI(process.env.REACT_APP_GEMINI_API_KEY);
+
+    // Refs for proper cleanup
     const videoRef = useRef(null);
-    const recognitionRef = useRef(null);
+    const audioRef = useRef(null);
+    const mediaRecorderRef = useRef(null);
+    const timerRef = useRef(null);
+    const isMountedRef = useRef(true);
+    const cameraTimeoutRef = useRef(null);
+    const initializationRef = useRef(false);
+    const fetchTimeoutRef = useRef(null);
+    const recordingTimeoutRef = useRef(null);
 
     // State management
     const [applicationData, setApplicationData] = useState(null);
@@ -29,74 +40,178 @@ const InterviewPage = () => {
     const [error, setError] = useState(null);
     const [interviewCompleted, setInterviewCompleted] = useState(false);
     const [finalScore, setFinalScore] = useState(null);
-    const [timeRemaining, setTimeRemaining] = useState(300); // 5 minutes
+    const [timeRemaining, setTimeRemaining] = useState(300);
     const [currentAnswerText, setCurrentAnswerText] = useState("");
     const [liveTranscript, setLiveTranscript] = useState("");
     const [aiAnalysis, setAiAnalysis] = useState(null);
+    const [audioChunks, setAudioChunks] = useState([]);
 
-    // Initialize camera and fetch data
-    useEffect(() => {
-        const initializeInterview = async () => {
-            if (!applicationId) {
-                setError('No application ID provided');
-                setLoading(false);
-                return;
+    // Fetch application data with timeout and retry logic
+    const fetchApplicationData = useCallback(async () => {
+        if (initializationRef.current) return;
+        initializationRef.current = true;
+
+        try {
+            console.log('Fetching application data...');
+
+            const fetchPromise = Promise.race([
+                getDoc(doc(db, 'applications', applicationId)),
+                new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('Firebase query timeout')), 10000)
+                )
+            ]);
+
+            const appDoc = await fetchPromise;
+
+            if (!appDoc.exists()) {
+                throw new Error('Application not found');
             }
 
-            try {
-                await fetchApplicationData();
-                setTimeout(async () => {
-                    try {
-                        const stream = await navigator.mediaDevices.getUserMedia({
-                            video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
-                            audio: true
-                        });
+            const appData = appDoc.data();
+            console.log('Application data fetched successfully:', appData);
 
-                        if (videoRef.current) {
-                            videoRef.current.srcObject = stream;
-                            videoRef.current.onloadedmetadata = () => setIsVideoReady(true);
-                        }
-                    } catch (mediaError) {
-                        console.error('Camera access error:', mediaError);
-                        setIsVideoReady(true);
-                        setError('Camera access denied. Continuing with audio-only interview.');
+            if (isMountedRef.current) {
+                setApplicationData(appData);
+            }
+
+            // Fetch job data with timeout
+            try {
+                const jobFetchPromise = Promise.race([
+                    getDoc(doc(db, 'jobs', appData.jobId)),
+                    new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('Job fetch timeout')), 8000)
+                    )
+                ]);
+
+                const jobDoc = await jobFetchPromise;
+
+                if (jobDoc.exists()) {
+                    const jobInfo = jobDoc.data();
+                    console.log('Job data fetched successfully:', jobInfo);
+                    if (isMountedRef.current) {
+                        setJobData(jobInfo);
                     }
-                }, 100);
+                    await generateQuestions(appData, jobInfo);
+                } else {
+                    console.log('Job not found, using fallback');
+                    await generateQuestions(appData, { title: 'this position', skills: [] });
+                }
+            } catch (jobError) {
+                console.error('Error fetching job data, using fallback:', jobError);
+                await generateQuestions(appData, { title: 'this position', skills: [] });
+            }
+
+        } catch (err) {
+            console.error('Error fetching application data:', err);
+            if (isMountedRef.current) {
+                if (err.message.includes('timeout')) {
+                    setError('Connection timeout. Using fallback questions.');
+                } else {
+                    setError('Failed to load interview data. Using fallback questions.');
+                }
+                setFallbackQuestions();
+            }
+        }
+    }, [applicationId]);
+
+    // Initialize camera and microphone
+    const initializeCamera = useCallback(async () => {
+        if (!isMountedRef.current) return;
+
+        cameraTimeoutRef.current = setTimeout(async () => {
+            if (!isMountedRef.current) return;
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 },
+                        facingMode: 'user'
+                    },
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        sampleRate: 44100
+                    }
+                });
+
+                if (videoRef.current && isMountedRef.current) {
+                    videoRef.current.srcObject = stream;
+                    videoRef.current.onloadedmetadata = () => {
+                        if (isMountedRef.current) {
+                            setIsVideoReady(true);
+                        }
+                    };
+                } else {
+                    stream.getTracks().forEach(track => track.stop());
+                }
+            } catch (mediaError) {
+                console.error('Camera/microphone access error:', mediaError);
+                if (isMountedRef.current) {
+                    setIsVideoReady(true);
+                    setError('Camera/microphone access denied. Please allow permissions and refresh.');
+                }
+            }
+        }, 100);
+    }, []);
+
+    // Initialize interview with overall timeout
+    useEffect(() => {
+        if (!applicationId || initializationRef.current) return;
+
+        const initializeInterview = async () => {
+            try {
+                fetchTimeoutRef.current = setTimeout(() => {
+                    if (isMountedRef.current && loading) {
+                        console.log('Overall initialization timeout, using fallbacks');
+                        setError('Loading timeout. Using fallback questions.');
+                        setFallbackQuestions();
+                        setIsVideoReady(true);
+                        setLoading(false);
+                    }
+                }, 15000);
+
+                await Promise.all([
+                    fetchApplicationData(),
+                    initializeCamera()
+                ]);
+
             } catch (err) {
                 console.error('Error initializing interview:', err);
-                setError('Failed to load interview data');
+                if (isMountedRef.current) {
+                    setError('Failed to initialize interview. Using fallback questions.');
+                    setFallbackQuestions();
+                    setIsVideoReady(true);
+                }
             } finally {
-                setLoading(false);
+                if (fetchTimeoutRef.current) {
+                    clearTimeout(fetchTimeoutRef.current);
+                }
+                if (isMountedRef.current) {
+                    setLoading(false);
+                }
             }
         };
 
         initializeInterview();
 
         return () => {
-            cleanupResources();
+            isMountedRef.current = false;
+            if (fetchTimeoutRef.current) {
+                clearTimeout(fetchTimeoutRef.current);
+            }
+            if (recordingTimeoutRef.current) {
+                clearTimeout(recordingTimeoutRef.current);
+            }
         };
     }, [applicationId]);
 
-    // Cleanup function
-    const cleanupResources = () => {
-        if (videoRef.current?.srcObject) {
-            const tracks = videoRef.current.srcObject.getTracks();
-            tracks.forEach(track => track.stop());
-        }
-        if (recognitionRef.current) {
-            recognitionRef.current.stop();
-            recognitionRef.current = null;
-        }
-        if ('speechSynthesis' in window) {
-            speechSynthesis.cancel();
-        }
-    };
-
-    // Timer for 5-minute interview
+    // Timer effect
     useEffect(() => {
-        let timer;
-        if (interviewStarted && timeRemaining > 0 && !interviewCompleted) {
-            timer = setInterval(() => {
+        if (interviewStarted && timeRemaining > 0 && !interviewCompleted && isMountedRef.current) {
+            timerRef.current = setInterval(() => {
+                if (!isMountedRef.current) return;
+
                 setTimeRemaining(prev => {
                     if (prev <= 1) {
                         endInterview();
@@ -106,37 +221,17 @@ const InterviewPage = () => {
                 });
             }, 1000);
         }
-        return () => clearInterval(timer);
-    }, [interviewStarted, timeRemaining, interviewCompleted]);
 
-    const fetchApplicationData = async () => {
-        try {
-            console.log('Fetching application data...');
-            const appDoc = await getDoc(doc(db, 'applications', applicationId));
-            if (!appDoc.exists()) throw new Error('Application not found');
-
-            const appData = appDoc.data();
-            console.log('Application data:', appData);
-            setApplicationData(appData);
-
-            const jobDoc = await getDoc(doc(db, 'jobs', appData.jobId));
-            if (jobDoc.exists()) {
-                const jobInfo = jobDoc.data();
-                console.log('Job data:', jobInfo);
-                setJobData(jobInfo);
-                await generateQuestions(appData, jobInfo);
-            } else {
-                console.log('Job not found, using basic questions');
-                await generateQuestions(appData, { title: 'this position', skills: [] });
+        return () => {
+            if (timerRef.current) {
+                clearInterval(timerRef.current);
+                timerRef.current = null;
             }
-        } catch (err) {
-            console.error('Error fetching data:', err);
-            setError('Failed to load interview data');
-            setFallbackQuestions();
-        }
-    };
+        };
+    }, [interviewStarted, interviewCompleted]);
 
     const setFallbackQuestions = () => {
+        console.log('Setting fallback questions');
         const fallbackQuestions = [
             "Hello! I'm your AI interviewer. Tell me about yourself and your background.",
             "What interests you about this position and our company?",
@@ -144,492 +239,486 @@ const InterviewPage = () => {
             "Tell me about a challenging project you've worked on.",
             "Where do you see yourself in the next few years?"
         ];
-        console.log('Using fallback questions');
-        setQuestions(fallbackQuestions);
+        if (isMountedRef.current) {
+            setQuestions(fallbackQuestions);
+            console.log('Fallback questions set:', fallbackQuestions);
+        }
     };
 
+    // Generate questions using Google Gemini
     const generateQuestions = async (appData, jobInfo) => {
         try {
-            console.log('Generating questions with OpenRouter...');
-
+            console.log('Generating AI questions with Gemini...');
             const resumeSkills = appData?.resumeData?.skills || [];
             const jobSkills = jobInfo?.skills || [];
             const jobTitle = jobInfo?.title || 'this position';
 
             const prompt = `Generate 5 personalized interview questions for ${appData.candidateName || 'the candidate'} applying for ${jobTitle}.
 
-Resume Skills: ${resumeSkills.join(', ') || 'Not specified'}
-Job Requirements: ${jobSkills.join(', ') || 'Not specified'}
-Experience Level: ${appData?.resumeData?.experience || 'Not specified'}
+Candidate Information:
+- Resume Skills: ${resumeSkills.join(', ') || 'Not specified'}
+- Experience Level: ${appData?.resumeData?.experience || 'Not specified'}
 
-Make questions relevant to their background and the job role. Return ONLY a JSON array of strings with no additional text.
+Job Information:
+- Position: ${jobTitle}
+- Required Skills: ${jobSkills.join(', ') || 'Not specified'}
 
-Example format:
-["Question 1 here", "Question 2 here", "Question 3 here", "Question 4 here", "Question 5 here"]`;
+Generate questions that assess:
+1. Technical competency
+2. Problem-solving abilities
+3. Communication skills
+4. Cultural fit
+5. Career motivation
 
-            const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${process.env.REACT_APP_OPENROUTER_API_KEY}`,
-                    'Content-Type': 'application/json',
-                    'HTTP-Referer': window.location.origin,
-                    'X-Title': 'AI Interview System'
-                },
-                body: JSON.stringify({
-                    model: 'google/gemma-7b-it:free',
-                    messages: [
-                        {
-                            role: 'system',
-                            content: 'You are an expert AI interviewer. Generate relevant, professional interview questions. Respond with ONLY a JSON array of strings, no additional text or formatting.'
-                        },
-                        {
-                            role: 'user',
-                            content: prompt
-                        }
-                    ],
-                    temperature: 0.7,
-                    max_tokens: 1000
-                })
-            });
+Return exactly 5 questions in this JSON format:
+{
+  "questions": [
+    "Question 1 text here",
+    "Question 2 text here", 
+    "Question 3 text here",
+    "Question 4 text here",
+    "Question 5 text here"
+  ]
+}
 
-            const data = await response.json();
-            console.log('OpenRouter response:', data);
+Make questions specific to the candidate's background and job requirements.`;
 
-            if (data.choices && data.choices[0] && data.choices[0].message) {
+            const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+
+            const result = await Promise.race([
+                model.generateContent(prompt),
+                new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('Gemini API timeout')), 10000)
+                )
+            ]);
+
+            const response = await result.response;
+            const text = response.text();
+
+            if (text && isMountedRef.current) {
                 try {
-                    let content = data.choices[0].message.content.trim();
-                    content = content.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+                    let cleanText = text.trim();
+                    cleanText = cleanText.replace(/```json\n?/g, '').replace(/```\n?/g, '');
 
-                    const questions = JSON.parse(content);
+                    const parsed = JSON.parse(cleanText);
 
-                    if (Array.isArray(questions) && questions.length > 0) {
-                        console.log('Questions generated by AI:', questions);
-                        setQuestions(questions);
+                    if (parsed.questions && Array.isArray(parsed.questions) && parsed.questions.length >= 5) {
+                        console.log('Gemini questions generated successfully:', parsed.questions);
+                        setQuestions(parsed.questions);
                     } else {
-                        throw new Error('Invalid questions format');
+                        throw new Error('Invalid questions format from Gemini');
                     }
                 } catch (parseError) {
-                    console.error('Failed to parse AI response:', parseError);
+                    console.error('Failed to parse Gemini response, using fallback:', parseError);
                     setFallbackQuestions();
                 }
             } else {
-                console.error('Invalid response structure from OpenRouter:', data);
+                console.log('No Gemini response, using fallback');
                 setFallbackQuestions();
             }
         } catch (error) {
-            console.error('Error calling OpenRouter:', error);
+            console.error('Error generating questions with Gemini, using fallback:', error);
             setFallbackQuestions();
         }
     };
 
-    // Updated speakText function with better error handling
-    const speakText = async (text) => {
+    // ElevenLabs Text-to-Speech
+    const speakTextWithElevenLabs = async (text) => {
+        if (!isMountedRef.current) return;
+
         setAiSpeaking(true);
 
         try {
-            console.log('Attempting ElevenLabs TTS...');
+            console.log('Generating speech with ElevenLabs...');
 
-            const response = await fetch('https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM', {
-                method: 'POST',
-                headers: {
-                    'Accept': 'audio/mpeg',
-                    'Content-Type': 'application/json',
-                    'xi-api-key': process.env.REACT_APP_ELEVENLABS_API_KEY
-                },
-                body: JSON.stringify({
-                    text: text,
-                    model_id: "eleven_monolingual_v1",
-                    voice_settings: {
-                        stability: 0.5,
-                        similarity_boost: 0.75
-                    }
-                })
-            });
+            const response = await Promise.race([
+                fetch(`https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM`, {
+                    method: 'POST',
+                    headers: {
+                        'Accept': 'audio/mpeg',
+                        'Content-Type': 'application/json',
+                        'xi-api-key': process.env.REACT_APP_ELEVENLABS_API_KEY
+                    },
+                    body: JSON.stringify({
+                        text: text,
+                        model_id: "eleven_monolingual_v1",
+                        voice_settings: {
+                            stability: 0.5,
+                            similarity_boost: 0.75,
+                            style: 0.0,
+                            use_speaker_boost: true
+                        }
+                    })
+                }),
+                new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('ElevenLabs TTS timeout')), 15000)
+                )
+            ]);
 
-            if (response.ok) {
-                console.log('ElevenLabs TTS successful');
-                const audioBlob = await response.blob();
-                const audioUrl = URL.createObjectURL(audioBlob);
-                const audio = new Audio(audioUrl);
+            if (!response.ok) {
+                throw new Error(`ElevenLabs API error: ${response.status}`);
+            }
+
+            const audioBlob = await response.blob();
+            const audioUrl = URL.createObjectURL(audioBlob);
+
+            if (audioRef.current && isMountedRef.current) {
+                audioRef.current.src = audioUrl;
 
                 return new Promise((resolve) => {
-                    audio.onended = () => {
-                        setAiSpeaking(false);
+                    const cleanup = () => {
+                        if (isMountedRef.current) {
+                            setAiSpeaking(false);
+                        }
                         URL.revokeObjectURL(audioUrl);
                         resolve();
                     };
 
-                    audio.onerror = () => {
-                        console.error('Audio playback failed');
-                        setAiSpeaking(false);
-                        URL.revokeObjectURL(audioUrl);
-                        fallbackSpeech(text);
-                        resolve();
-                    };
+                    audioRef.current.onended = cleanup;
+                    audioRef.current.onerror = cleanup;
 
-                    audio.play().catch(err => {
-                        console.error('Failed to play audio:', err);
-                        fallbackSpeech(text);
-                        resolve();
-                    });
+                    if (isMountedRef.current) {
+                        audioRef.current.play().catch(cleanup);
+                    } else {
+                        cleanup();
+                    }
                 });
-            } else {
-                const errorText = await response.text();
-                console.error(`ElevenLabs API failed: ${response.status} - ${errorText}`);
-
-                // If unauthorized, log the API key issue
-                if (response.status === 401) {
-                    console.error('ElevenLabs API Key Error - Check your API key');
-                    console.log('Current API Key:', process.env.REACT_APP_ELEVENLABS_API_KEY ? 'Present' : 'Missing');
-                }
-
-                throw new Error(`ElevenLabs API failed: ${response.status}`);
             }
         } catch (error) {
             console.error('ElevenLabs TTS error:', error);
-            fallbackSpeech(text);
+            if (isMountedRef.current) {
+                setError(`Speech synthesis failed: ${error.message}`);
+                setAiSpeaking(false);
+            }
         }
     };
 
-    const fallbackSpeech = (text) => {
-        console.log('Using fallback browser TTS');
-        return new Promise((resolve) => {
-            if ('speechSynthesis' in window) {
-                // Cancel any ongoing speech
-                speechSynthesis.cancel();
+    // Start recording audio for ElevenLabs STT
+    const startRecordingWithElevenLabs = async () => {
+        if (!isMountedRef.current) return;
 
-                const utterance = new SpeechSynthesisUtterance(text);
-
-                // Wait for voices to load
-                const setVoiceAndSpeak = () => {
-                    const voices = speechSynthesis.getVoices();
-                    const preferredVoice = voices.find(voice =>
-                        voice.name.includes('Google') ||
-                        voice.name.includes('Microsoft') ||
-                        voice.lang.startsWith('en')
-                    ) || voices[0];
-
-                    if (preferredVoice) {
-                        utterance.voice = preferredVoice;
-                    }
-
-                    utterance.onstart = () => setAiSpeaking(true);
-                    utterance.onend = () => {
-                        setAiSpeaking(false);
-                        resolve();
-                    };
-                    utterance.onerror = () => {
-                        setAiSpeaking(false);
-                        resolve();
-                    };
-                    utterance.rate = 0.9;
-                    utterance.pitch = 1;
-
-                    speechSynthesis.speak(utterance);
-                };
-
-                if (speechSynthesis.getVoices().length === 0) {
-                    speechSynthesis.onvoiceschanged = setVoiceAndSpeak;
-                } else {
-                    setVoiceAndSpeak();
-                }
-            } else {
-                setAiSpeaking(false);
-                resolve();
-            }
-        });
-    };
-
-    const startRecording = async () => {
         try {
-            console.log('Starting speech recognition...');
-
-            if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-                throw new Error('Speech recognition not supported in this browser');
+            const stream = videoRef.current?.srcObject;
+            if (!stream) {
+                throw new Error('No audio stream available');
             }
 
-            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-            const recognition = new SpeechRecognition();
+            const mediaRecorder = new MediaRecorder(stream, {
+                mimeType: 'audio/webm;codecs=opus'
+            });
 
-            recognition.continuous = true;
-            recognition.interimResults = true;
-            recognition.lang = 'en-US';
-            recognition.maxAlternatives = 1;
+            const chunks = [];
 
-            let finalTranscript = '';
-            let speechTimeout;
-
-            recognition.onresult = (event) => {
-                let interimTranscript = '';
-                finalTranscript = '';
-
-                for (let i = event.resultIndex; i < event.results.length; i++) {
-                    if (event.results[i].isFinal) {
-                        finalTranscript += event.results[i][0].transcript + ' ';
-                    } else {
-                        interimTranscript += event.results[i][0].transcript;
-                    }
-                }
-
-                const fullTranscript = finalTranscript + interimTranscript;
-                setLiveTranscript(fullTranscript);
-
-                if (finalTranscript.trim()) {
-                    setCurrentAnswerText(finalTranscript.trim());
-
-                    // Auto-stop if user pauses for 3 seconds
-                    clearTimeout(speechTimeout);
-                    speechTimeout = setTimeout(() => {
-                        if (recognitionRef.current) {
-                            recognitionRef.current.stop();
-                        }
-                    }, 3000);
+            mediaRecorder.ondataavailable = (event) => {
+                if (event.data.size > 0) {
+                    chunks.push(event.data);
                 }
             };
 
-            recognition.onstart = () => {
-                console.log('Speech recognition started');
-                setIsRecording(true);
-            };
+            mediaRecorder.onstop = async () => {
+                if (!isMountedRef.current) return;
 
-            recognition.onend = () => {
-                console.log('Speech recognition ended');
                 setIsRecording(false);
-                clearTimeout(speechTimeout);
 
-                if (finalTranscript.trim()) {
-                    processAnswer(finalTranscript.trim());
-                } else if (currentAnswerText.trim()) {
-                    processAnswer(currentAnswerText.trim());
+                if (chunks.length > 0) {
+                    const audioBlob = new Blob(chunks, { type: 'audio/webm' });
+                    await transcribeWithElevenLabs(audioBlob);
                 } else {
-                    console.log('No speech detected, moving to next question');
-                    setTimeout(() => nextQuestion(), 1000);
+                    setTimeout(() => {
+                        if (isMountedRef.current) nextQuestion();
+                    }, 1000);
                 }
             };
 
-            recognition.onerror = (event) => {
-                console.error('Speech recognition error:', event.error);
-                setIsRecording(false);
-                clearTimeout(speechTimeout);
-
-                // Don't show error for common issues, just move on
-                if (event.error !== 'no-speech' && event.error !== 'aborted') {
-                    setError(`Speech recognition error: ${event.error}`);
+            mediaRecorder.onerror = (event) => {
+                console.error('MediaRecorder error:', event.error);
+                if (isMountedRef.current) {
+                    setError('Recording failed');
+                    setIsRecording(false);
+                    setTimeout(() => {
+                        if (isMountedRef.current) nextQuestion();
+                    }, 1000);
                 }
-
-                setTimeout(() => nextQuestion(), 1000);
             };
 
-            recognitionRef.current = recognition;
-            recognition.start();
+            setAudioChunks(chunks);
+            mediaRecorderRef.current = mediaRecorder;
 
-            // Auto-stop after 45 seconds
-            setTimeout(() => {
-                if (recognitionRef.current && isRecording) {
-                    recognitionRef.current.stop();
+            mediaRecorder.start(1000); // Collect data every second
+            setIsRecording(true);
+            setLiveTranscript("Recording started... Speak now!");
+
+            // Auto-stop recording after 45 seconds
+            recordingTimeoutRef.current = setTimeout(() => {
+                if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+                    mediaRecorderRef.current.stop();
                 }
             }, 45000);
 
-        } catch (err) {
-            console.error('Error starting recording:', err);
-            setError('Speech recognition failed. Please check microphone permissions.');
-            setIsRecording(false);
-            setTimeout(() => nextQuestion(), 2000);
+        } catch (error) {
+            console.error('Error starting recording:', error);
+            if (isMountedRef.current) {
+                setError('Failed to start recording');
+                setIsRecording(false);
+            }
         }
     };
 
+    // Stop recording
     const stopRecording = () => {
-        console.log('Manual stop recording');
-        if (recognitionRef.current) {
-            recognitionRef.current.stop();
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+            mediaRecorderRef.current.stop();
         }
-        setIsRecording(false);
+        if (recordingTimeoutRef.current) {
+            clearTimeout(recordingTimeoutRef.current);
+        }
+        if (isMountedRef.current) {
+            setIsRecording(false);
+        }
     };
 
-    const processAnswer = async (transcript) => {
-        if (isProcessing) return; // Prevent double processing
+    // ElevenLabs Speech-to-Text
+    const transcribeWithElevenLabs = async (audioBlob) => {
+        if (!isMountedRef.current) return;
 
         setIsProcessing(true);
-        setLiveTranscript("");
-
-        console.log('Processing answer:', transcript);
+        setLiveTranscript("Processing your response...");
 
         try {
-            const analysis = await analyzeAnswer(transcript);
+            console.log('Transcribing with ElevenLabs...');
 
-            const answerData = {
-                question: questions[currentQuestion],
-                answer: transcript,
-                analysis: analysis,
-                timestamp: new Date()
-            };
+            // Convert webm to wav/mp3 format for better compatibility
+            const formData = new FormData();
+            formData.append('audio', audioBlob, 'recording.webm');
+            formData.append('model_id', 'eleven_multilingual_v2');
 
-            setAnswers(prev => [...prev, answerData]);
-            setAiAnalysis(analysis);
+            const response = await Promise.race([
+                fetch('https://api.elevenlabs.io/v1/speech-to-text', {
+                    method: 'POST',
+                    headers: {
+                        'xi-api-key': process.env.REACT_APP_ELEVENLABS_API_KEY
+                    },
+                    body: formData
+                }),
+                new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('ElevenLabs STT timeout')), 30000)
+                )
+            ]);
 
-            console.log('Answer processed, analysis:', analysis);
+            if (!response.ok) {
+                throw new Error(`ElevenLabs STT API error: ${response.status}`);
+            }
 
-            // Move to next question after 2 seconds
-            setTimeout(() => {
+            const result = await response.json();
+
+            if (result.text && result.text.trim() && isMountedRef.current) {
+                const transcript = result.text.trim();
+                console.log('Transcription successful:', transcript);
+                setCurrentAnswerText(transcript);
+                setLiveTranscript(transcript);
+
+                setTimeout(() => {
+                    if (isMountedRef.current) {
+                        processAnswer(transcript);
+                    }
+                }, 1000);
+            } else {
+                console.log('No transcription result');
+                if (isMountedRef.current) {
+                    setLiveTranscript("No speech detected. Moving to next question...");
+                    setTimeout(() => {
+                        if (isMountedRef.current) nextQuestion();
+                    }, 2000);
+                }
+            }
+        } catch (error) {
+            console.error('ElevenLabs STT error:', error);
+            if (isMountedRef.current) {
+                setError(`Transcription failed: ${error.message}`);
+                setLiveTranscript("Transcription failed. Moving to next question...");
+                setTimeout(() => {
+                    if (isMountedRef.current) nextQuestion();
+                }, 2000);
+            }
+        } finally {
+            if (isMountedRef.current) {
                 setIsProcessing(false);
-                nextQuestion();
-            }, 2000);
-
-        } catch (err) {
-            console.error('Error processing answer:', err);
-            setIsProcessing(false);
-            setTimeout(() => nextQuestion(), 1000);
+            }
         }
     };
 
-    const analyzeAnswer = async (answer) => {
-        try {
-            console.log('Analyzing answer with OpenRouter...');
+    // Process answer using Google Gemini
+    const processAnswer = async (transcript) => {
+        if (isProcessing || !isMountedRef.current) return;
 
-            const prompt = `Analyze this interview answer and provide scores (0-100) and feedback:
+        setIsProcessing(true);
+
+        try {
+            const analysis = await analyzeAnswerWithGemini(transcript);
+
+            if (isMountedRef.current) {
+                const answerData = {
+                    question: questions[currentQuestion],
+                    answer: transcript,
+                    analysis: analysis,
+                    timestamp: new Date()
+                };
+
+                setAnswers(prev => [...prev, answerData]);
+                setAiAnalysis(analysis);
+
+                setTimeout(() => {
+                    if (isMountedRef.current) {
+                        setIsProcessing(false);
+                        nextQuestion();
+                    }
+                }, 2000);
+            }
+        } catch (err) {
+            console.error('Error processing answer:', err);
+            if (isMountedRef.current) {
+                setIsProcessing(false);
+                setTimeout(() => {
+                    if (isMountedRef.current) nextQuestion();
+                }, 1000);
+            }
+        }
+    };
+
+    // Analyze answer using Google Gemini
+    const analyzeAnswerWithGemini = async (answer) => {
+        try {
+            const prompt = `Analyze this interview answer and provide detailed scores:
 
 Question: ${questions[currentQuestion]}
 Answer: ${answer}
-Job Title: ${jobData?.title || 'Unknown'}
-Job Skills Required: ${jobData?.skills?.join(', ') || 'Not specified'}
-Candidate Skills: ${applicationData?.resumeData?.skills?.join(', ') || 'Not specified'}
 
-Evaluate on:
-1. Relevance to the question and job role (0-100)
-2. Clarity and communication skills (0-100)
-3. Technical depth and knowledge (0-100)
-4. Overall professionalism (0-100)
+Evaluate the response on these criteria (score 0-100 for each):
+1. Relevance - How well does the answer address the question?
+2. Clarity - How clear and well-structured is the response?
+3. Technical Depth - Technical knowledge demonstrated (if applicable)
+4. Communication - Overall communication effectiveness
 
-Respond with ONLY a JSON object in this exact format:
+Provide scores and brief feedback in this exact JSON format:
 {
   "relevance": 85,
   "clarity": 90,
   "technical_depth": 75,
   "communication": 88,
-  "feedback": "Strong answer demonstrating good understanding..."
+  "feedback": "Strong response with good examples. Could improve on technical details.",
+  "strengths": ["Clear communication", "Good examples"],
+  "improvements": ["More technical depth", "Specific metrics"]
 }`;
 
-            const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${process.env.REACT_APP_OPENROUTER_API_KEY}`,
-                    'Content-Type': 'application/json',
-                    'HTTP-Referer': window.location.origin,
-                    'X-Title': 'AI Interview System'
-                },
-                body: JSON.stringify({
-                    model: 'mistralai/mistral-7b-instruct:free',
-                    messages: [
-                        {
-                            role: 'system',
-                            content: 'You are an expert interview analyst. Provide fair, constructive evaluation. Respond with ONLY valid JSON, no additional text.'
-                        },
-                        {
-                            role: 'user',
-                            content: prompt
-                        }
-                    ],
-                    temperature: 0.3,
-                    max_tokens: 500
-                })
-            });
+            const model = genAI.getGenerativeModel({ model: "gemini-pro" });
 
-            const data = await response.json();
+            const result = await Promise.race([
+                model.generateContent(prompt),
+                new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('Gemini analysis timeout')), 8000)
+                )
+            ]);
 
-            if (data.choices && data.choices[0] && data.choices[0].message) {
+            const response = await result.response;
+            const text = response.text();
+
+            if (text) {
                 try {
-                    let content = data.choices[0].message.content.trim();
-                    content = content.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+                    let cleanText = text.trim();
+                    cleanText = cleanText.replace(/```json\n?/g, '').replace(/```\n?/g, '');
 
-                    const analysis = JSON.parse(content);
+                    const analysis = JSON.parse(cleanText);
 
-                    const validAnalysis = {
+                    return {
                         relevance: Math.min(100, Math.max(0, parseInt(analysis.relevance) || 70)),
                         clarity: Math.min(100, Math.max(0, parseInt(analysis.clarity) || 75)),
                         technical_depth: Math.min(100, Math.max(0, parseInt(analysis.technical_depth) || 65)),
                         communication: Math.min(100, Math.max(0, parseInt(analysis.communication) || 80)),
-                        feedback: analysis.feedback || "Good response with room for improvement."
+                        feedback: analysis.feedback || "Good response.",
+                        strengths: analysis.strengths || ["Clear communication"],
+                        improvements: analysis.improvements || ["More detail"]
                     };
-
-                    return validAnalysis;
                 } catch (parseError) {
-                    console.error('Failed to parse analysis:', parseError);
+                    console.error('Failed to parse Gemini analysis:', parseError);
                     return getFallbackAnalysis();
                 }
             } else {
-                throw new Error('Invalid response from OpenRouter');
+                return getFallbackAnalysis();
             }
         } catch (error) {
-            console.error('Analysis error:', error);
+            console.error('Gemini analysis error:', error);
             return getFallbackAnalysis();
         }
     };
 
-    const getFallbackAnalysis = () => {
-        return {
-            relevance: Math.floor(Math.random() * 30) + 70,
-            clarity: Math.floor(Math.random() * 25) + 75,
-            technical_depth: Math.floor(Math.random() * 35) + 65,
-            communication: Math.floor(Math.random() * 20) + 80,
-            feedback: "Your answer shows understanding. Consider providing more specific examples."
-        };
-    };
+    const getFallbackAnalysis = () => ({
+        relevance: Math.floor(Math.random() * 30) + 70,
+        clarity: Math.floor(Math.random() * 25) + 75,
+        technical_depth: Math.floor(Math.random() * 35) + 65,
+        communication: Math.floor(Math.random() * 20) + 80,
+        feedback: "Good response with room for improvement.",
+        strengths: ["Communication skills"],
+        improvements: ["More specific examples"]
+    });
 
     const nextQuestion = async () => {
-        if (interviewCompleted) return;
-
-        console.log(`Moving to next question. Current: ${currentQuestion}, Total: ${questions.length}`);
+        if (interviewCompleted || !isMountedRef.current) return;
 
         if (currentQuestion < questions.length - 1) {
             const nextQuestionIndex = currentQuestion + 1;
-            setCurrentQuestion(nextQuestionIndex);
-            setCurrentAnswerText("");
-            setLiveTranscript("");
-            setAiAnalysis(null);
+            if (isMountedRef.current) {
+                setCurrentQuestion(nextQuestionIndex);
+                setCurrentAnswerText("");
+                setLiveTranscript("");
+                setAiAnalysis(null);
+            }
 
-            // Small delay then speak next question
             setTimeout(async () => {
-                if (!interviewCompleted) {
-                    await speakText(questions[nextQuestionIndex]);
-                    // Start recording after speech ends
+                if (!interviewCompleted && isMountedRef.current) {
+                    await speakTextWithElevenLabs(questions[nextQuestionIndex]);
                     setTimeout(() => {
-                        if (!interviewCompleted) {
-                            startRecording();
+                        if (!interviewCompleted && isMountedRef.current) {
+                            startRecordingWithElevenLabs();
                         }
-                    }, 500);
+                    }, 1000);
                 }
             }, 1000);
         } else {
-            console.log('All questions completed, ending interview');
             endInterview();
         }
     };
 
     const endInterview = async () => {
-        if (interviewCompleted) return; // Prevent multiple calls
+        if (interviewCompleted || !isMountedRef.current) return;
 
-        console.log('Ending interview...');
         setInterviewCompleted(true);
         setIsRecording(false);
         setAiSpeaking(false);
         setIsProcessing(false);
 
-        // Clean up resources
-        cleanupResources();
+        // Stop any ongoing recording
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+            mediaRecorderRef.current.stop();
+        }
+
+        // Stop audio playback
+        if (audioRef.current) {
+            audioRef.current.pause();
+        }
 
         const totalScore = calculateFinalScore();
         setFinalScore(totalScore);
 
         try {
             await saveInterviewResults(totalScore);
-            console.log('Interview results saved successfully');
         } catch (error) {
             console.error('Failed to save interview results:', error);
         }
 
-        // Navigate to feedback page
         setTimeout(() => {
-            navigate(`/interview-feedback?applicationId=${applicationId}`);
+            if (isMountedRef.current) {
+                navigate(`/interview-feedback?applicationId=${applicationId}`);
+            }
         }, 1500);
     };
 
@@ -645,6 +734,8 @@ Respond with ONLY a JSON object in this exact format:
     };
 
     const saveInterviewResults = async (score) => {
+        if (!isMountedRef.current) return;
+
         try {
             await updateDoc(doc(db, 'applications', applicationId), {
                 interviewStatus: 'completed',
@@ -663,19 +754,19 @@ Respond with ONLY a JSON object in this exact format:
     };
 
     const startInterview = async () => {
-        if (questions.length === 0) {
-            setError('No questions available');
-            return;
-        }
+        if (questions.length === 0 || !isMountedRef.current) return;
 
-        console.log('Starting interview with questions:', questions);
         setInterviewStarted(true);
 
         setTimeout(async () => {
-            await speakText(questions[0]);
-            setTimeout(() => {
-                startRecording();
-            }, 500);
+            if (isMountedRef.current) {
+                await speakTextWithElevenLabs(questions[0]);
+                setTimeout(() => {
+                    if (isMountedRef.current) {
+                        startRecordingWithElevenLabs();
+                    }
+                }, 1000);
+            }
         }, 500);
     };
 
@@ -686,10 +777,29 @@ Respond with ONLY a JSON object in this exact format:
     };
 
     const handleEndInterview = () => {
-        if (window.confirm('Are you sure you want to end the interview? This action cannot be undone.')) {
+        if (window.confirm('Are you sure you want to end the interview?')) {
             endInterview();
         }
     };
+
+    // Auth check
+    useEffect(() => {
+        if (!user && !loading) {
+            navigate('/login');
+        }
+    }, [user, loading, navigate]);
+
+    if (!user) {
+        return (
+            <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center">
+                <div className="text-center">
+                    <div className="animate-spin rounded-full h-16 w-16 border-b-4 border-indigo-600 mx-auto mb-4"></div>
+                    <h3 className="text-xl font-semibold text-gray-700 mb-2">Checking Authentication</h3>
+                    <p className="text-gray-500">Please wait...</p>
+                </div>
+            </div>
+        );
+    }
 
     if (loading) {
         return (
@@ -698,6 +808,9 @@ Respond with ONLY a JSON object in this exact format:
                     <div className="animate-spin rounded-full h-16 w-16 border-b-4 border-indigo-600 mx-auto mb-4"></div>
                     <h3 className="text-xl font-semibold text-gray-700 mb-2">Preparing Your Interview</h3>
                     <p className="text-gray-500">Setting up AI interviewer and loading questions...</p>
+                    {error && (
+                        <p className="text-yellow-600 text-sm mt-2">⚠️ {error}</p>
+                    )}
                 </div>
             </div>
         );
@@ -729,7 +842,6 @@ Respond with ONLY a JSON object in this exact format:
         return (
             <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 py-8">
                 <div className="max-w-4xl mx-auto px-4">
-                    {/* Header */}
                     <div className="text-center mb-8">
                         <div className="inline-flex items-center justify-center w-16 h-16 bg-indigo-600 rounded-full mb-4">
                             <svg className="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -740,10 +852,23 @@ Respond with ONLY a JSON object in this exact format:
                         <p className="text-xl text-gray-600 max-w-2xl mx-auto">
                             You're about to start a personalized AI interview for <span className="font-semibold text-indigo-600">{jobData?.title || 'this position'}</span>
                         </p>
+                        <div className="mt-4 flex items-center justify-center space-x-4 text-sm">
+                            <div className="flex items-center space-x-2">
+                                <div className="w-3 h-3 rounded-full bg-purple-500"></div>
+                                <span>ElevenLabs Voice AI</span>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                                <div className={`w-3 h-3 rounded-full ${questions.length > 0 ? 'bg-green-500' : 'bg-yellow-500'}`}></div>
+                                <span>Questions: {questions.length > 0 ? 'Ready' : 'Loading...'}</span>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                                <div className={`w-3 h-3 rounded-full ${isVideoReady ? 'bg-green-500' : 'bg-yellow-500'}`}></div>
+                                <span>Audio/Video: {isVideoReady ? 'Ready' : 'Setting up...'}</span>
+                            </div>
+                        </div>
                     </div>
 
                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                        {/* Video Preview */}
                         <div className="bg-white rounded-2xl shadow-xl p-6">
                             <h3 className="text-lg font-semibold text-gray-900 mb-4">Camera Preview</h3>
                             <div className="relative bg-black rounded-xl overflow-hidden">
@@ -758,85 +883,76 @@ Respond with ONLY a JSON object in this exact format:
                                     <div className="absolute inset-0 flex items-center justify-center">
                                         <div className="text-center">
                                             <div className="animate-pulse rounded-full h-12 w-12 bg-white/20 mx-auto mb-3"></div>
-                                            <p className="text-white text-sm">Connecting to camera...</p>
+                                            <p className="text-white text-sm">Connecting to camera and microphone...</p>
                                         </div>
                                     </div>
                                 )}
                                 {isVideoReady && (
                                     <div className="absolute top-4 right-4 bg-green-500 text-white px-3 py-1 rounded-full text-sm font-medium">
-                                        Camera Ready
+                                        Ready
                                     </div>
                                 )}
                             </div>
+                            {/* Hidden audio element for playback */}
+                            <audio ref={audioRef} style={{ display: 'none' }} />
                         </div>
 
-                        {/* Interview Information */}
                         <div className="bg-white rounded-2xl shadow-xl p-6">
                             <h3 className="text-lg font-semibold text-gray-900 mb-4">What to Expect</h3>
                             <div className="space-y-4">
-                                <div className="flex items-start space-x-3">
-                                    <div className="flex-shrink-0 w-6 h-6 bg-indigo-100 rounded-full flex items-center justify-center">
-                                        <span className="text-indigo-600 text-sm font-medium">1</span>
-                                    </div>
-                                    <p className="text-gray-600">{questions.length} personalized questions based on your resume</p>
-                                </div>
-                                <div className="flex items-start space-x-3">
-                                    <div className="flex-shrink-0 w-6 h-6 bg-indigo-100 rounded-full flex items-center justify-center">
-                                        <span className="text-indigo-600 text-sm font-medium">2</span>
-                                    </div>
-                                    <p className="text-gray-600">AI will speak questions with natural voice</p>
-                                </div>
-                                <div className="flex items-start space-x-3">
-                                    <div className="flex-shrink-0 w-6 h-6 bg-indigo-100 rounded-full flex items-center justify-center">
-                                        <span className="text-indigo-600 text-sm font-medium">3</span>
-                                    </div>
-                                    <p className="text-gray-600">Live transcription of your responses</p>
-                                </div>
-                                <div className="flex items-start space-x-3">
-                                    <div className="flex-shrink-0 w-6 h-6 bg-indigo-100 rounded-full flex items-center justify-center">
-                                        <span className="text-indigo-600 text-sm font-medium">4</span>
-                                    </div>
-                                    <p className="text-gray-600">Maximum 5 minutes total interview time</p>
-                                </div>
-                                <div className="flex items-start space-x-3">
-                                    <div className="flex-shrink-0 w-6 h-6 bg-indigo-100 rounded-full flex items-center justify-center">
-                                        <span className="text-indigo-600 text-sm font-medium">5</span>
-                                    </div>
-                                    <p className="text-gray-600">Real-time AI analysis and feedback</p>
-                                </div>
+                                {questions.length > 0 ? (
+                                    [
+                                        `${questions.length} personalized questions powered by Google Gemini`,
+                                        "High-quality voice synthesis using ElevenLabs",
+                                        "Advanced speech recognition and transcription",
+                                        "Maximum 5 minutes total interview time",
+                                        "Detailed AI-powered feedback and scoring"
+                                    ].map((text, index) => (
+                                        <div key={index} className="flex items-start space-x-3">
+                                            <div className="flex-shrink-0 w-6 h-6 bg-indigo-100 rounded-full flex items-center justify-center">
+                                                <span className="text-indigo-600 text-sm font-medium">{index + 1}</span>
+                                            </div>
+                                            <p className="text-gray-600">{text}</p>
+                                        </div>
+                                    ))
+                                ) : (
+                                    <p className="text-gray-600 italic">Loading questions...</p>
+                                )}
                             </div>
 
-                            <div className="mt-6 p-4 bg-blue-50 rounded-lg">
+                            <div className="mt-6 p-4 bg-purple-50 rounded-lg">
                                 <div className="flex items-center space-x-2 mb-2">
-                                    <svg className="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                    <svg className="w-5 h-5 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
                                     </svg>
-                                    <span className="font-medium text-blue-900">Pro Tips</span>
+                                    <span className="font-medium text-purple-900">ElevenLabs AI Voice</span>
                                 </div>
-                                <ul className="text-blue-800 text-sm space-y-1">
-                                    <li>• Speak clearly and at a moderate pace</li>
-                                    <li>• Look at the camera when responding</li>
-                                    <li>• Ensure good lighting and minimal background noise</li>
+                                <ul className="text-purple-800 text-sm space-y-1">
+                                    <li>• Natural, human-like voice synthesis</li>
+                                    <li>• Advanced speech-to-text recognition</li>
+                                    <li>• Speak clearly and naturally</li>
+                                    <li>• Wait for questions to finish before responding</li>
                                 </ul>
                             </div>
                         </div>
                     </div>
 
-                    {/* Start Button */}
                     <div className="text-center mt-8">
                         <button
                             onClick={startInterview}
-                            disabled={questions.length === 0}
-                            className="inline-flex items-center px-8 py-4 bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-semibold rounded-xl hover:from-indigo-700 hover:to-purple-700 disabled:opacity-50 disabled:cursor-not-allowed transform hover:scale-105 transition-all duration-200 shadow-lg"
+                            disabled={questions.length === 0 || !isVideoReady}
+                            className="inline-flex items-center px-8 py-4 bg-gradient-to-r from-purple-600 to-indigo-600 text-white font-semibold rounded-xl hover:from-purple-700 hover:to-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transform hover:scale-105 transition-all duration-200 shadow-lg"
                         >
                             <svg className="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.828 14.828a4 4 0 01-5.656 0M9 10h1.01M15 10h1.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
                             </svg>
-                            Start AI Interview
+                            Start AI Interview with ElevenLabs
                         </button>
 
-                        {questions.length === 0 && (
-                            <p className="text-red-500 text-sm mt-2">Loading questions...</p>
+                        {(questions.length === 0 || !isVideoReady) && (
+                            <p className="text-red-500 text-sm mt-2">
+                                {error ? error : "Setting up interview components..."}
+                            </p>
                         )}
 
                         {error && (
@@ -851,12 +967,27 @@ Respond with ONLY a JSON object in this exact format:
     return (
         <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 py-4">
             <div className="max-w-7xl mx-auto px-4">
-                {/* Header with timer and progress */}
+                {/* Header */}
                 <div className="bg-white rounded-2xl shadow-lg p-6 mb-6">
                     <div className="flex justify-between items-center mb-4">
                         <div className="flex items-center space-x-4">
                             <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse"></div>
                             <h2 className="text-xl font-semibold text-gray-900">AI Interview in Progress</h2>
+                            <div className="flex items-center space-x-2 text-sm">
+                                <span className="px-2 py-1 rounded-full text-xs bg-purple-100 text-purple-800">
+                                    ElevenLabs AI
+                                </span>
+                                {isRecording && (
+                                    <span className="px-2 py-1 rounded-full text-xs bg-red-100 text-red-800 animate-pulse">
+                                        Recording
+                                    </span>
+                                )}
+                                {aiSpeaking && (
+                                    <span className="px-2 py-1 rounded-full text-xs bg-blue-100 text-blue-800 animate-pulse">
+                                        AI Speaking
+                                    </span>
+                                )}
+                            </div>
                         </div>
                         <div className="flex items-center space-x-4">
                             <div className={`text-2xl font-mono ${timeRemaining <= 60 ? 'text-red-600' : 'text-gray-700'}`}>
@@ -875,7 +1006,7 @@ Respond with ONLY a JSON object in this exact format:
                         <span className="text-sm text-gray-600">Question {currentQuestion + 1} of {questions.length}</span>
                         <div className="flex-1 mx-4 bg-gray-200 rounded-full h-3">
                             <div
-                                className="bg-gradient-to-r from-indigo-500 to-purple-500 h-3 rounded-full transition-all duration-500"
+                                className="bg-gradient-to-r from-purple-500 to-indigo-500 h-3 rounded-full transition-all duration-500"
                                 style={{ width: `${((currentQuestion + 1) / questions.length) * 100}%` }}
                             ></div>
                         </div>
@@ -886,7 +1017,7 @@ Respond with ONLY a JSON object in this exact format:
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                    {/* Video and AI Status */}
+                    {/* Left Column - Video and Analysis */}
                     <div className="lg:col-span-1">
                         <div className="bg-white rounded-2xl shadow-lg p-6 mb-6">
                             <h3 className="text-lg font-semibold text-gray-900 mb-4">Video Feed</h3>
@@ -899,7 +1030,6 @@ Respond with ONLY a JSON object in this exact format:
                                     className="w-full h-48 object-cover"
                                 />
 
-                                {/* Status indicators */}
                                 {isRecording && (
                                     <div className="absolute top-4 left-4 flex items-center space-x-2 bg-red-600 text-white px-3 py-1 rounded-full text-sm font-medium">
                                         <div className="w-2 h-2 bg-white rounded-full animate-pulse"></div>
@@ -908,7 +1038,7 @@ Respond with ONLY a JSON object in this exact format:
                                 )}
 
                                 {aiSpeaking && (
-                                    <div className="absolute top-4 right-4 flex items-center space-x-2 bg-blue-600 text-white px-3 py-1 rounded-full text-sm font-medium">
+                                    <div className="absolute top-4 right-4 flex items-center space-x-2 bg-purple-600 text-white px-3 py-1 rounded-full text-sm font-medium">
                                         <div className="w-2 h-2 bg-white rounded-full animate-ping"></div>
                                         <span>AI Speaking</span>
                                     </div>
@@ -917,12 +1047,11 @@ Respond with ONLY a JSON object in this exact format:
                                 {isProcessing && (
                                     <div className="absolute bottom-4 left-4 flex items-center space-x-2 bg-yellow-600 text-white px-3 py-1 rounded-full text-sm font-medium">
                                         <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-white"></div>
-                                        <span>Analyzing...</span>
+                                        <span>Processing...</span>
                                     </div>
                                 )}
                             </div>
 
-                            {/* Controls */}
                             <div className="flex justify-center">
                                 <button
                                     onClick={stopRecording}
@@ -937,7 +1066,6 @@ Respond with ONLY a JSON object in this exact format:
                             </div>
                         </div>
 
-                        {/* AI Analysis */}
                         {aiAnalysis && (
                             <div className="bg-white rounded-2xl shadow-lg p-6">
                                 <h3 className="text-lg font-semibold text-gray-900 mb-4">Real-time Analysis</h3>
@@ -963,44 +1091,57 @@ Respond with ONLY a JSON object in this exact format:
                                         </div>
                                     ))}
                                 </div>
+                                {aiAnalysis.feedback && (
+                                    <div className="mt-4 p-3 bg-blue-50 rounded-lg">
+                                        <p className="text-sm text-gray-700">{aiAnalysis.feedback}</p>
+                                    </div>
+                                )}
                             </div>
                         )}
                     </div>
 
-                    {/* Question and Transcript */}
+                    {/* Right Column - Question and Transcript */}
                     <div className="lg:col-span-2">
                         <div className="bg-white rounded-2xl shadow-lg p-6 mb-6">
                             <h3 className="text-lg font-semibold text-gray-900 mb-4">Current Question</h3>
-                            <div className="bg-gradient-to-r from-blue-50 to-indigo-50 p-6 rounded-xl border-l-4 border-indigo-500">
+                            <div className="bg-gradient-to-r from-purple-50 to-indigo-50 p-6 rounded-xl border-l-4 border-purple-500">
                                 <p className="text-gray-800 text-lg leading-relaxed">
                                     {questions[currentQuestion]}
                                 </p>
                             </div>
                         </div>
 
-                        {/* Live Transcript */}
                         <div className="bg-white rounded-2xl shadow-lg p-6 mb-6">
                             <div className="flex items-center justify-between mb-4">
-                                <h3 className="text-lg font-semibold text-gray-900">Live Transcript</h3>
-                                {isRecording && (
-                                    <div className="flex items-center space-x-2 text-red-600">
-                                        <div className="w-2 h-2 bg-red-600 rounded-full animate-pulse"></div>
-                                        <span className="text-sm font-medium">Listening...</span>
-                                    </div>
-                                )}
+                                <h3 className="text-lg font-semibold text-gray-900">Live Transcript (ElevenLabs)</h3>
+                                <div className="flex items-center space-x-2">
+                                    {isRecording && (
+                                        <div className="flex items-center space-x-2 text-red-600">
+                                            <div className="w-2 h-2 bg-red-600 rounded-full animate-pulse"></div>
+                                            <span className="text-sm font-medium">Recording...</span>
+                                        </div>
+                                    )}
+                                    {isProcessing && (
+                                        <div className="flex items-center space-x-2 text-yellow-600">
+                                            <div className="w-2 h-2 bg-yellow-600 rounded-full animate-spin"></div>
+                                            <span className="text-sm font-medium">Processing...</span>
+                                        </div>
+                                    )}
+                                </div>
                             </div>
                             <div className="min-h-[120px] bg-gray-50 rounded-lg p-4">
                                 {liveTranscript ? (
                                     <p className="text-gray-800 leading-relaxed">{liveTranscript}</p>
                                 ) : (
                                     <p className="text-gray-400 italic">
-                                        {isRecording ? "Start speaking..." : "Your response will appear here"}
+                                        {isRecording ? "Recording your response..." :
+                                            aiSpeaking ? "AI is speaking..." :
+                                                "Your response will appear here"}
                                     </p>
                                 )}
                             </div>
                         </div>
 
-                        {/* Interview Progress */}
                         <div className="bg-white rounded-2xl shadow-lg p-6">
                             <h3 className="text-lg font-semibold text-gray-900 mb-4">Interview Progress</h3>
                             <div className="space-y-3">
@@ -1009,13 +1150,13 @@ Respond with ONLY a JSON object in this exact format:
                                         <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium ${index < currentQuestion
                                                 ? 'bg-green-500 text-white'
                                                 : index === currentQuestion
-                                                    ? 'bg-indigo-500 text-white'
+                                                    ? 'bg-purple-500 text-white'
                                                     : 'bg-gray-200 text-gray-600'
                                             }`}>
                                             {index < currentQuestion ? '✓' : index + 1}
                                         </div>
                                         <div className="flex-1">
-                                            <p className={`text-sm ${index === currentQuestion ? 'font-medium text-indigo-600' : 'text-gray-600'
+                                            <p className={`text-sm ${index === currentQuestion ? 'font-medium text-purple-600' : 'text-gray-600'
                                                 }`}>
                                                 Question {index + 1}
                                             </p>
