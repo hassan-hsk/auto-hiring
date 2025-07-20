@@ -22,62 +22,129 @@ const ApplicantDashboard = () => {
                     return;
                 }
 
-                // Fetch applications
-                const applicationsQuery = query(
-                    collection(db, "applications"),
-                    where("applicantId", "==", user.uid),
-                    orderBy("appliedAt", "desc")
-                );
+                // Fetch applications - Try with index first, fallback without orderBy
+                let applicationsData = [];
+                try {
+                    // This query requires an index
+                    const applicationsQuery = query(
+                        collection(db, "applications"),
+                        where("applicantId", "==", user.uid),
+                        orderBy("appliedAt", "desc")
+                    );
+                    const applicationsSnapshot = await getDocs(applicationsQuery);
+                    
+                    // Process each application and fetch job details
+                    for (const appDoc of applicationsSnapshot.docs) {
+                        const appData = appDoc.data();
+                        let jobData = null;
 
-                const applicationsSnapshot = await getDocs(applicationsQuery);
-                const applicationsData = [];
-
-                // Process each application and fetch job details
-                for (const appDoc of applicationsSnapshot.docs) {
-                    const appData = appDoc.data();
-                    let jobData = null;
-
-                    // Fetch job details if jobId exists
-                    if (appData.jobId) {
-                        try {
-                            const jobDoc = await getDoc(doc(db, "jobsPosts", appData.jobId));
-                            if (jobDoc.exists()) {
-                                jobData = jobDoc.data();
+                        // Fetch job details if jobId exists
+                        if (appData.jobId) {
+                            try {
+                                const jobDoc = await getDoc(doc(db, "jobsPosts", appData.jobId));
+                                if (jobDoc.exists()) {
+                                    jobData = jobDoc.data();
+                                }
+                            } catch (jobError) {
+                                console.warn(`Failed to fetch job data for ${appData.jobId}:`, jobError);
                             }
-                        } catch (jobError) {
-                            console.warn(`Failed to fetch job data for ${appData.jobId}:`, jobError);
                         }
-                    }
 
-                    applicationsData.push({
-                        id: appDoc.id,
-                        ...appData,
-                        // Use job data if available, otherwise use application data
-                        jobTitle: jobData?.title || appData.jobTitle || 'Job Application',
-                        companyName: jobData?.company || appData.companyName || 'Company',
-                        // Scores from application data
-                        aiScore: appData.jobMatchScore || appData.aiScore || appData.matchScore || 0,
-                        resumeScore: appData.resumeQualityScore || 0,
-                        interviewScore: appData.interviewScore || 0,
-                        status: appData.status || 'pending',
-                        appliedAt: appData.appliedAt || appData.createdAt || null,
-                        interviewEligible: appData.interviewEligible || false,
-                        interviewStatus: appData.interviewStatus || 'not_started'
+                        applicationsData.push({
+                            id: appDoc.id,
+                            ...appData,
+                            // Use job data if available, otherwise use application data
+                            jobTitle: jobData?.title || appData.jobTitle || 'Job Application',
+                            companyName: jobData?.company || appData.companyName || 'Company',
+                            // Scores from application data
+                            aiScore: appData.jobMatchScore || appData.aiScore || appData.matchScore || 0,
+                            resumeScore: appData.resumeQualityScore || 0,
+                            interviewScore: appData.interviewScore || 0,
+                            status: appData.status || 'pending',
+                            appliedAt: appData.appliedAt || appData.createdAt || null,
+                            interviewEligible: appData.interviewEligible || false,
+                            interviewStatus: appData.interviewStatus || 'not_started'
+                        });
+                    }
+                } catch (indexError) {
+                    console.warn("Index not available, falling back to simple query:", indexError);
+                    
+                    // Fallback query without orderBy (doesn't require index)
+                    const simpleQuery = query(
+                        collection(db, "applications"),
+                        where("applicantId", "==", user.uid)
+                    );
+                    const snapshot = await getDocs(simpleQuery);
+                    
+                    for (const appDoc of snapshot.docs) {
+                        const appData = appDoc.data();
+                        let jobData = null;
+
+                        if (appData.jobId) {
+                            try {
+                                const jobDoc = await getDoc(doc(db, "jobsPosts", appData.jobId));
+                                if (jobDoc.exists()) {
+                                    jobData = jobDoc.data();
+                                }
+                            } catch (jobError) {
+                                console.warn(`Failed to fetch job data for ${appData.jobId}:`, jobError);
+                            }
+                        }
+
+                        applicationsData.push({
+                            id: appDoc.id,
+                            ...appData,
+                            jobTitle: jobData?.title || appData.jobTitle || 'Job Application',
+                            companyName: jobData?.company || appData.companyName || 'Company',
+                            aiScore: appData.jobMatchScore || appData.aiScore || appData.matchScore || 0,
+                            resumeScore: appData.resumeQualityScore || 0,
+                            interviewScore: appData.interviewScore || 0,
+                            status: appData.status || 'pending',
+                            appliedAt: appData.appliedAt || appData.createdAt || null,
+                            interviewEligible: appData.interviewEligible || false,
+                            interviewStatus: appData.interviewStatus || 'not_started'
+                        });
+                    }
+                    
+                    // Sort manually since we couldn't use orderBy
+                    applicationsData.sort((a, b) => {
+                        const dateA = a.appliedAt || a.createdAt || new Date(0);
+                        const dateB = b.appliedAt || b.createdAt || new Date(0);
+                        
+                        if (dateA?.toDate) return dateB.toDate() - dateA.toDate();
+                        if (dateA instanceof Date) return dateB - dateA;
+                        return new Date(dateB) - new Date(dateA);
                     });
                 }
 
-                // Fetch job suggestions (recent jobs)
-                const jobsQuery = query(
-                    collection(db, "jobsPosts"),
-                    orderBy("createdAt", "desc"),
-                    limit(3)
-                );
-                const jobsSnapshot = await getDocs(jobsQuery);
-                const jobsData = jobsSnapshot.docs.map((doc) => ({
-                    id: doc.id,
-                    ...doc.data(),
-                    matchPercentage: Math.floor(Math.random() * 30) + 70 // Random for now
-                }));
+                // Fetch job suggestions (recent jobs) - This query should work without index
+                let jobsData = [];
+                try {
+                    const jobsQuery = query(
+                        collection(db, "jobsPosts"),
+                        orderBy("createdAt", "desc"),
+                        limit(3)
+                    );
+                    const jobsSnapshot = await getDocs(jobsQuery);
+                    jobsData = jobsSnapshot.docs.map((doc) => ({
+                        id: doc.id,
+                        ...doc.data(),
+                        matchPercentage: Math.floor(Math.random() * 30) + 70 // Random for now
+                    }));
+                } catch (jobsError) {
+                    console.warn("Error fetching job suggestions:", jobsError);
+                    // Fallback: get jobs without orderBy
+                    const simpleJobsQuery = query(
+                        collection(db, "jobsPosts"),
+                        limit(3)
+                    );
+                    const jobsSnapshot = await getDocs(simpleJobsQuery);
+                    jobsData = jobsSnapshot.docs.map((doc) => ({
+                        id: doc.id,
+                        ...doc.data(),
+                        matchPercentage: Math.floor(Math.random() * 30) + 70
+                    }));
+                }
 
                 setApplications(applicationsData);
                 setJobSuggestions(jobsData);
